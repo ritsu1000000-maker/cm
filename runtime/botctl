@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CTL=(/usr/bin/supervisorctl -c /opt/botbox/supervisord.conf)
+LOG_DIR="/workspace/.botbox/logs"
+BOT_DIR="/workspace/bot"
+CONFIG="/workspace/bot.config"
+
+detect_command() {
+  cd "$BOT_DIR"
+
+  if [ -f package.json ]; then
+    python - <<'PY' >/tmp/bot-command.txt 2>/dev/null || true
+import json, os
+try:
+    d=json.load(open("package.json",encoding="utf-8"))
+    scripts=d.get("scripts") or {}
+    if "start" in scripts:
+        print("npm start")
+    elif isinstance(d.get("main"),str) and os.path.exists(d["main"]):
+        print("node "+d["main"])
+except Exception:
+    pass
+PY
+    if [ -s /tmp/bot-command.txt ]; then
+      cat /tmp/bot-command.txt
+      return
+    fi
+
+    for f in bot.js index.js main.js app.js; do
+      [ -f "$f" ] && { echo "node $f"; return; }
+    done
+  fi
+
+  for f in bot.py main.py app.py; do
+    [ -f "$f" ] && { echo "python $f"; return; }
+  done
+
+  py_count="$(find . -maxdepth 1 -type f -name '*.py' | wc -l)"
+  js_count="$(find . -maxdepth 1 -type f -name '*.js' | wc -l)"
+
+  if [ "$py_count" -eq 1 ]; then
+    echo "python $(basename "$(find . -maxdepth 1 -type f -name '*.py' | head -n1)")"
+    return
+  fi
+
+  if [ "$js_count" -eq 1 ]; then
+    echo "node $(basename "$(find . -maxdepth 1 -type f -name '*.js' | head -n1)")"
+    return
+  fi
+}
+
+
+ENV_FILE="/workspace/.env"
+
+env_valid_key() {
+  [[ "${1:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
+}
+
+env_list() {
+  if [ ! -f "$ENV_FILE" ]; then
+    echo "環境変数はありません。"
+    return
+  fi
+  grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" \
+    | sed 's/=.*$/=<hidden>/' \
+    | sort
+}
+
+env_set() {
+  key="${1:-}"
+  if ! env_valid_key "$key"; then
+    echo "環境変数名が不正です。"
+    return 1
+  fi
+
+  if [ "$#" -ge 2 ]; then
+    value="$2"
+  else
+    printf "%s の値: " "$key"
+    IFS= read -r -s value
+    echo
+  fi
+
+  python - "$ENV_FILE" "$key" "$value" <<'PY'
+import re, sys
+from pathlib import Path
+
+path=Path(sys.argv[1])
+key=sys.argv[2]
+value=sys.argv[3]
+pat=re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+if not pat.fullmatch(key):
+    raise SystemExit("invalid key")
+
+data={}
+if path.exists():
+    for raw in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        line=raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k,v=line.split("=",1)
+        k=k.strip()
+        if pat.fullmatch(k):
+            data[k]=v
+
+data[key]=value.replace("\r","").replace("\n","\\n")
+lines=[
+    "# Discord Bot environment variables",
+    "# Managed by Bot Upload UI / botctl",
+]
+for k in sorted(data):
+    lines.append(f"{k}={data[k]}")
+path.write_text("\n".join(lines)+"\n",encoding="utf-8")
+PY
+
+  echo "$key を保存しました。Bot再起動後に反映されます。"
+}
+
+env_del() {
+  key="${1:-}"
+  if ! env_valid_key "$key"; then
+    echo "環境変数名が不正です。"
+    return 1
+  fi
+
+  python - "$ENV_FILE" "$key" <<'PY'
+import re, sys
+from pathlib import Path
+
+path=Path(sys.argv[1])
+key=sys.argv[2]
+pat=re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+data={}
+if path.exists():
+    for raw in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        line=raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k,v=line.split("=",1)
+        k=k.strip()
+        if pat.fullmatch(k):
+            data[k]=v
+
+data.pop(key,None)
+lines=[
+    "# Discord Bot environment variables",
+    "# Managed by Bot Upload UI / botctl",
+]
+for k in sorted(data):
+    lines.append(f"{k}={data[k]}")
+path.write_text("\n".join(lines)+"\n",encoding="utf-8")
+PY
+
+  echo "$key を削除しました。Bot再起動後に反映されます。"
+}
+
+case "${1:-help}" in
+  start)
+    "${CTL[@]}" start discord-bot
+    ;;
+  stop)
+    "${CTL[@]}" stop discord-bot
+    ;;
+  restart)
+    "${CTL[@]}" restart discord-bot
+    ;;
+  status)
+    "${CTL[@]}" status discord-bot
+    ;;
+  detect)
+    cmd="$(detect_command || true)"
+    if [ -n "$cmd" ]; then
+      printf 'BOT_WORKDIR=/workspace/bot\nBOT_COMMAND=%s\n' "$cmd" > "$CONFIG"
+      echo "検出して設定しました: $cmd"
+    else
+      echo "起動ファイルを自動検出できませんでした。"
+      exit 1
+    fi
+    ;;
+  install)
+    cd "$BOT_DIR"
+    if [ -f package.json ]; then
+      echo "npm install..."
+      npm install
+    fi
+    if [ -f requirements.txt ]; then
+      echo "pip install -r requirements.txt..."
+      pip install -r requirements.txt
+    fi
+    ;;
+  ready)
+    "$0" detect
+    "$0" install
+    "$0" restart
+    "$0" status
+    ;;
+  logs)
+    touch "$LOG_DIR/bot.log"
+    tail -n 200 -f "$LOG_DIR/bot.log"
+    ;;
+  errors)
+    touch "$LOG_DIR/bot-error.log"
+    tail -n 200 -f "$LOG_DIR/bot-error.log"
+    ;;
+  install-logs)
+    touch "$LOG_DIR/install.log"
+    tail -n 200 -f "$LOG_DIR/install.log"
+    ;;
+  config)
+    echo "----- /workspace/bot.config -----"
+    cat "$CONFIG" 2>/dev/null || true
+    echo
+    echo "----- .env keys -----"
+    if [ -f /workspace/.env ]; then
+      grep -E '^[A-Za-z_][A-Za-z0-9_]*=' /workspace/.env | sed 's/=.*$/=<hidden>/'
+    else
+      echo ".env not found"
+    fi
+    ;;
+  upload-url)
+    echo "http://127.0.0.1:7682"
+    ;;
+  web-status)
+    "${CTL[@]}" status web-terminal upload-server
+    ;;
+  env-list)
+    env_list
+    ;;
+  env-set)
+    shift
+    env_set "$@"
+    ;;
+  env-del)
+    shift
+    env_del "$@"
+    ;;
+  env-restart)
+    "${CTL[@]}" restart discord-bot
+    ;;
+  help|*)
+    cat <<'HELP'
+botctl start          Bot起動
+botctl stop           Bot停止
+botctl restart        Bot再起動
+botctl status         Bot状態
+botctl detect         起動ファイルを自動検出して設定
+botctl install        npm / pip依存関係を導入
+botctl ready          detect → install → restart → status
+botctl logs           Bot標準出力ログ
+botctl errors         Botエラーログ
+botctl install-logs   自動インストールログ
+botctl config         起動設定・環境変数名
+botctl upload-url     アップロード画面URL
+botctl env-list       環境変数名一覧（値は非表示）
+botctl env-set KEY    環境変数を追加/上書き（値を非表示入力）
+botctl env-del KEY    環境変数を削除
+botctl env-restart    Bot再起動して環境変数を反映
+botctl web-status     Web CMD / Upload Server状態
+HELP
+    ;;
+esac

@@ -1,0 +1,31 @@
+services:
+  virtual-cmd:
+    build:
+      context: .
+    container_name: discord-bot-virtual-cmd
+    restart: unless-stopped
+
+    env_file:
+      - ./console.env
+
+    ports:
+      - "127.0.0.1:7681:7681"
+      - "127.0.0.1:7682:7682"
+
+    volumes:
+      - ./workspace:/workspace
+
+    working_dir: /workspace
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    pids_limit: 192
+    mem_limit: 768m
+    cpus: 0.50
+
+    tmpfs:
+      - /tmp:size=128m,mode=1777
